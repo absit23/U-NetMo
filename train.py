@@ -16,7 +16,7 @@ class CombinedLoss(nn.Module):
     Combines Cross-Entropy Loss with Soft Dice Loss for robust multi-class segmentation.
     Helps mitigate class imbalance in concrete damage segmentation.
     """
-    def __init__(self, num_classes=6, weight_ce=1.0, weight_dice=1.0):
+    def __init__(self, num_classes=8, weight_ce=1.0, weight_dice=1.0):
         super(CombinedLoss, self).__init__()
         self.num_classes = num_classes
         self.weight_ce = weight_ce
@@ -24,6 +24,9 @@ class CombinedLoss(nn.Module):
         self.ce = nn.CrossEntropyLoss()
 
     def forward(self, logits, targets):
+        # Fix: Cast targets to torch.long to match CrossEntropy and one_hot expectations
+        targets = targets.long()
+
         ce_loss = self.ce(logits, targets)
 
         probs = F.softmax(logits, dim=1)
@@ -75,7 +78,8 @@ def validate(model, dataloader, criterion, metrics_calculator, device):
 
         metrics_calculator.update(outputs, masks)
 
-    metrics = metrics_calculator.compute()
+    # Calculate validation metrics excluding background class 0
+    metrics = metrics_calculator.compute(include_background=False)
     metrics["loss"] = running_loss / len(dataloader)
     return metrics
 
@@ -143,8 +147,8 @@ def main(args):
         print(f"Epoch [{epoch:03d}/{args.epochs:03d}] | "
               f"Train Loss: {train_loss:.4f} | "
               f"Val Loss: {val_metrics['loss']:.4f} | "
-              f"Val mIoU: {val_metrics['mIoU']:.4f} | "
-              f"Val mDice: {val_metrics['mDice']:.4f}")
+              f"Val mIoU (no bg): {val_metrics['mIoU']:.4f} | "
+              f"Val mDice (no bg): {val_metrics['mDice']:.4f}")
 
         # State dict payload
         checkpoint_state = {
@@ -172,7 +176,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmarking Concrete Damage Segmentation Models")
     parser.add_argument("--data_dir", type=str, required=True, help="Path to Roboflow dataset directory")
     parser.add_argument("--model_name", type=str, default="unet_mobilenet", choices=["unet", "unet_mobilenet", "deeplabv3plus", "segformer"])
-    parser.add_argument("--num_classes", type=int, default=6, help="Number of segmentation classes")
+    parser.add_argument("--num_classes", type=int, default=8, help="Number of segmentation classes including background")
     parser.add_argument("--img_size", type=int, default=512, help="Image spatial resolution")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
     parser.add_argument("--epochs", type=int, default=50, help="Total training epochs")
