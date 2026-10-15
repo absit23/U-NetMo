@@ -10,18 +10,30 @@ from models.builder import build_model
 from utils.data_loading import ConcreteDamageDataset, get_transforms
 from utils.metrics import SegmentationMetrics
 
+# Semantic class names mapped directly to IDs 0 through 7
+CLASS_NAMES = [
+    "Background",
+    "Delamination",
+    "Efflorescence",
+    "Microcrack",
+    "Minor spalling",
+    "Moderate spalling",
+    "Rebar corrosion",
+    "Structural crack"
+]
 
-class CombinedLoss(nn.Module):
+
+class WeightedCombinedLoss(nn.Module):
     """
-    Combines Cross-Entropy Loss with Soft Dice Loss for robust multi-class segmentation.
-    Helps mitigate class imbalance in concrete damage segmentation.
+    Combines Weighted Cross-Entropy Loss with Soft Dice Loss.
+    Applies class weights to heavily penalize errors on rare damage categories.
     """
-    def __init__(self, num_classes=8, weight_ce=1.0, weight_dice=1.0):
-        super(CombinedLoss, self).__init__()
+    def __init__(self, num_classes=8, weight_ce=1.0, weight_dice=1.0, class_weights=None):
+        super(WeightedCombinedLoss, self).__init__()
         self.num_classes = num_classes
         self.weight_ce = weight_ce
         self.weight_dice = weight_dice
-        self.ce = nn.CrossEntropyLoss()
+        self.ce = nn.CrossEntropyLoss(weight=class_weights)
 
     def forward(self, logits, targets):
         targets = targets.long()
@@ -110,11 +122,10 @@ def main(args):
         pretrained=args.pretrained
     ).to(device)
 
-    # --- Model Structure & Parameter Summary ---
+    # Summary
     print("=" * 70)
     print(f" MODEL ARCHITECTURE & SUMMARY: {args.model_name.upper()}")
     print("=" * 70)
-    
     try:
         from torchinfo import summary
         summary(model, input_size=(args.batch_size, 3, args.img_size, args.img_size), device=device.type)
@@ -123,21 +134,24 @@ def main(args):
         print("-" * 70)
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        non_trainable_params = total_params - trainable_params
-        
-        print(f"Total Parameters:         {total_params:,}")
-        print(f"Trainable Parameters:     {trainable_params:,}")
-        print(f"Non-Trainable Parameters: {non_trainable_params:,}")
+        print(f"Total Parameters:     {total_params:,}")
+        print(f"Trainable Parameters: {trainable_params:,}")
     print("=" * 70 + "\n")
 
-    # 3. Loss, Optimizer & Scheduler
-    criterion = CombinedLoss(num_classes=args.num_classes)
+    # 3. Class Weights (Inverse pixel frequencies to prevent Microcrack/Minor Spalling collapse)
+    # Background (0.2), Delamination (1.0), Efflorescence (2.5), Microcrack (6.0),
+    # Minor spalling (12.0), Moderate spalling (2.0), Rebar corrosion (0.5), Structural crack (1.0)
+    class_weights = torch.tensor([0.2, 1.0, 2.5, 6.0, 12.0, 2.0, 0.5, 1.0], device=device)
+
+    criterion = WeightedCombinedLoss(num_classes=args.num_classes, class_weights=class_weights)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     
     metrics_calculator = SegmentationMetrics(num_classes=args.num_classes)
 
     best_miou = 0.0
+    best_epoch = 0
+    best_metrics = {}
     start_epoch = 1
 
     # 4. Resume Checkpoint Logic
@@ -152,8 +166,6 @@ def main(args):
             start_epoch = checkpoint["epoch"] + 1
             best_miou = checkpoint.get("best_miou", 0.0)
             print(f"=> Resumed from epoch {start_epoch}; best mIoU so far: {best_miou:.4f}")
-        else:
-            print(f"=> No checkpoint found at '{args.resume}'")
 
     print(f"\n--- Starting Training: {args.model_name} (Epochs {start_epoch} to {args.epochs}) ---")
     for epoch in range(start_epoch, args.epochs + 1):
@@ -175,6 +187,7 @@ def main(args):
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
             'best_miou': best_miou,
+            'val_metrics': val_metrics
         }
 
         last_path = os.path.join(args.checkpoint_dir, f"last_{args.model_name}.pth")
@@ -182,10 +195,35 @@ def main(args):
 
         if val_metrics['mIoU'] > best_miou:
             best_miou = val_metrics['mIoU']
+            best_epoch = epoch
+            best_metrics = val_metrics
             checkpoint_state['best_miou'] = best_miou
             best_path = os.path.join(args.checkpoint_dir, f"best_{args.model_name}.pth")
             torch.save(checkpoint_state, best_path)
             print(f" Saved new best model checkpoint to {best_path} (mIoU: {best_miou:.4f})")
+
+    # 5. Summary Output
+    print("\n" + "=" * 70)
+    print(f" TRAINING COMPLETE: {args.model_name.upper()}")
+    print("=" * 70)
+    print(f" Best Epoch:           {best_epoch} / {args.epochs}")
+    print(f" Best Val mIoU:        {best_miou:.4f} ({best_miou*100:.2f}%)")
+    if best_metrics:
+        print(f" Best Val F1 / mDice:  {best_metrics['mDice']:.4f} ({best_metrics['mDice']*100:.2f}%)")
+        print(f" Best Val Precision:   {best_metrics['mPrecision']:.4f} ({best_metrics['mPrecision']*100:.2f}%)")
+        print(f" Best Val Recall:      {best_metrics['mRecall']:.4f} ({best_metrics['mRecall']*100:.2f}%)")
+
+        print("\n--- BEST EPOCH PER-CLASS BREAKDOWN ---")
+        print(f"{'ID':<4} | {'Class Name':<20} | {'IoU':<10} | {'Dice (F1)':<10}")
+        print("-" * 55)
+        per_class_iou = best_metrics.get('per_class_iou', [])
+        per_class_dice = best_metrics.get('per_class_dice', [])
+        for cls_idx in range(args.num_classes):
+            name = CLASS_NAMES[cls_idx] if cls_idx < len(CLASS_NAMES) else f"Class {cls_idx}"
+            iou_val = per_class_iou[cls_idx] if cls_idx < len(per_class_iou) else 0.0
+            dice_val = per_class_dice[cls_idx] if cls_idx < len(per_class_dice) else 0.0
+            print(f"{cls_idx:<4} | {name:<20} | {iou_val:<10.4f} | {dice_val:<10.4f}")
+    print("=" * 70 + "\n")
 
 
 if __name__ == "__main__":
