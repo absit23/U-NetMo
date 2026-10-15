@@ -9,19 +9,17 @@ CLASS_NAMES = [
 ]
 
 class ExperimentTracker:
-    def __init__(self, runs_dir, exp_name, args):
-        self.exp_dir = os.path.join(runs_dir, exp_name)
-        self.weights_dir = os.path.join(self.exp_dir, "weights")
+    def __init__(self, exp_dir, args):
+        self.exp_dir = exp_dir
         self.csv_path = os.path.join(self.exp_dir, "metrics.csv")
         
-        os.makedirs(self.weights_dir, exist_ok=True)
+        os.makedirs(self.exp_dir, exist_ok=True)
         
         # Save hyperparameter configuration
         with open(os.path.join(self.exp_dir, "args.json"), "w") as f:
             json.dump(vars(args), f, indent=4)
 
     def log_epoch(self, epoch, train_loss, val_metrics, history):
-        # Update history dictionary
         history['epoch'].append(epoch)
         history['train_loss'].append(train_loss)
         history['val_loss'].append(val_metrics['loss'])
@@ -31,7 +29,6 @@ class ExperimentTracker:
         history['val_mRecall'].append(val_metrics['mRecall'])
         history['per_class_iou'].append(val_metrics['per_class_iou'])
 
-        # Append to CSV
         file_exists = os.path.isfile(self.csv_path)
         with open(self.csv_path, mode='a', newline='') as f:
             writer = csv.writer(f)
@@ -82,7 +79,7 @@ class ExperimentTracker:
         plt.savefig(os.path.join(self.exp_dir, "metrics_curve.png"), dpi=300)
         plt.close()
 
-        # Per-Class IoU Trajectory
+        # Per-Class IoU Trajectory Curve
         plt.figure(figsize=(10, 6))
         for idx, cls_name in enumerate(CLASS_NAMES):
             if cls_name == "Background":
