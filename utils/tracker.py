@@ -1,6 +1,8 @@
 import os
 import json
 import csv
+import matplotlib
+matplotlib.use('Agg')  # Force headless backend to prevent Colab plotting crashes
 import matplotlib.pyplot as plt
 
 CLASS_NAMES = [
@@ -20,15 +22,25 @@ class ExperimentTracker:
             json.dump(vars(args), f, indent=4)
 
     def log_epoch(self, epoch, train_loss, val_metrics, history):
-        history['epoch'].append(epoch)
-        history['train_loss'].append(train_loss)
-        history['val_loss'].append(val_metrics['loss'])
-        history['val_mIoU'].append(val_metrics['mIoU'])
-        history['val_mDice'].append(val_metrics['mDice'])
-        history['val_mPrecision'].append(val_metrics['mPrecision'])
-        history['val_mRecall'].append(val_metrics['mRecall'])
-        history['per_class_iou'].append(val_metrics['per_class_iou'])
+        # Convert tensor values safely to Python floats
+        t_loss = float(train_loss)
+        v_loss = float(val_metrics['loss'])
+        v_miou = float(val_metrics['mIoU'])
+        v_mdice = float(val_metrics['mDice'])
+        v_mprec = float(val_metrics['mPrecision'])
+        v_mrec = float(val_metrics['mRecall'])
+        per_class_iou = [float(x) for x in val_metrics.get('per_class_iou', [])]
 
+        history['epoch'].append(int(epoch))
+        history['train_loss'].append(t_loss)
+        history['val_loss'].append(v_loss)
+        history['val_mIoU'].append(v_miou)
+        history['val_mDice'].append(v_mdice)
+        history['val_mPrecision'].append(v_mprec)
+        history['val_mRecall'].append(v_mrec)
+        history['per_class_iou'].append(per_class_iou)
+
+        # Append to CSV
         file_exists = os.path.isfile(self.csv_path)
         with open(self.csv_path, mode='a', newline='') as f:
             writer = csv.writer(f)
@@ -40,10 +52,10 @@ class ExperimentTracker:
                 writer.writerow(headers)
             
             row = [
-                epoch, f"{train_loss:.4f}", f"{val_metrics['loss']:.4f}", 
-                f"{val_metrics['mIoU']:.4f}", f"{val_metrics['mDice']:.4f}", 
-                f"{val_metrics['mPrecision']:.4f}", f"{val_metrics['mRecall']:.4f}"
-            ] + [f"{iou:.4f}" for iou in val_metrics['per_class_iou']]
+                epoch, f"{t_loss:.4f}", f"{v_loss:.4f}", 
+                f"{v_miou:.4f}", f"{v_mdice:.4f}", 
+                f"{v_mprec:.4f}", f"{v_mrec:.4f}"
+            ] + [f"{iou:.4f}" for iou in per_class_iou]
             writer.writerow(row)
 
         self.plot_curves(history)
