@@ -1,1 +1,8 @@
-
+torch
+torchvision
+albumentations
+roboflow
+opencv-python
+Pillow
+tqdm
+numpy
