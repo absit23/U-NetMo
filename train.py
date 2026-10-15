@@ -1,10 +1,13 @@
 import os
+import json
+import csv
 import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 
 from models.builder import build_model
 from utils.data_loading import ConcreteDamageDataset, get_transforms
@@ -93,11 +96,90 @@ def validate(model, dataloader, criterion, metrics_calculator, device):
     return metrics
 
 
+def save_args(args, exp_dir):
+    """Saves training hyperparameter configuration as args.json."""
+    args_dict = vars(args)
+    with open(os.path.join(exp_dir, "args.json"), "w") as f:
+        json.dump(args_dict, f, indent=4)
+
+
+def append_metrics_csv(csv_path, row_data, is_first=False):
+    """Logs epoch metrics into a CSV spreadsheet."""
+    file_exists = os.path.isfile(csv_path)
+    with open(csv_path, mode='a', newline='') as f:
+        writer = csv.writer(f)
+        if not file_exists or is_first:
+            headers = [
+                "epoch", "train_loss", "val_loss", "val_mIoU", "val_mDice", 
+                "val_mPrecision", "val_mRecall"
+            ] + [f"IoU_{name}" for name in CLASS_NAMES]
+            writer.writerow(headers)
+        writer.writerow(row_data)
+
+
+def generate_and_save_plots(history, exp_dir):
+    """Generates loss, mIoU, precision/recall, and per-class IoU curves."""
+    epochs = history['epoch']
+
+    # 1. Training & Validation Loss Plot
+    plt.figure(figsize=(8, 5))
+    plt.plot(epochs, history['train_loss'], label='Train Loss', color='tab:blue', linewidth=2)
+    plt.plot(epochs, history['val_loss'], label='Val Loss', color='tab:orange', linewidth=2)
+    plt.title('Training & Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(os.path.join(exp_dir, "loss_curve.png"), dpi=300)
+    plt.close()
+
+    # 2. Overall Validation Metrics Plot
+    plt.figure(figsize=(8, 5))
+    plt.plot(epochs, history['val_mIoU'], label='mIoU', color='tab:green', linewidth=2)
+    plt.plot(epochs, history['val_mDice'], label='mDice (F1)', color='tab:red', linewidth=2)
+    plt.plot(epochs, history['val_mPrecision'], label='Precision', color='tab:purple', linewidth=2)
+    plt.plot(epochs, history['val_mRecall'], label='Recall', color='tab:brown', linewidth=2)
+    plt.title('Validation Performance Metrics (Excl. Background)')
+    plt.xlabel('Epoch')
+    plt.ylabel('Score')
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(os.path.join(exp_dir, "metrics_curve.png"), dpi=300)
+    plt.close()
+
+    # 3. Per-Class IoU Trajectory Plot
+    plt.figure(figsize=(10, 6))
+    for idx, cls_name in enumerate(CLASS_NAMES):
+        if cls_name == "Background":
+            continue
+        iou_series = [h[idx] for h in history['per_class_iou']]
+        plt.plot(epochs, iou_series, label=cls_name, linewidth=1.8)
+    plt.title('Per-Class IoU Trajectories Over Epochs')
+    plt.xlabel('Epoch')
+    plt.ylabel('IoU')
+    plt.legend(bbox_to_anchor=(1.04, 1), loc="upper left")
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(os.path.join(exp_dir, "per_class_iou_curve.png"), dpi=300)
+    plt.close()
+
+
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}\n")
 
-    os.makedirs(args.checkpoint_dir, exist_ok=True)
+    # Experiment Output Directory Setup
+    exp_dir = os.path.join(args.runs_dir, args.exp_name)
+    weights_dir = os.path.join(exp_dir, "weights")
+    os.makedirs(weights_dir, exist_ok=True)
+
+    # Save hyperparameter configuration
+    save_args(args, exp_dir)
+    csv_path = os.path.join(exp_dir, "metrics.csv")
+
+    print(f"Experiment artifacts will be saved to: {exp_dir}\n")
 
     # 1. Dataset & DataLoaders
     train_dataset = ConcreteDamageDataset(
@@ -138,9 +220,7 @@ def main(args):
         print(f"Trainable Parameters: {trainable_params:,}")
     print("=" * 70 + "\n")
 
-    # 3. Class Weights (Inverse pixel frequencies to prevent Microcrack/Minor Spalling collapse)
-    # Background (0.2), Delamination (1.0), Efflorescence (2.5), Microcrack (6.0),
-    # Minor spalling (12.0), Moderate spalling (2.0), Rebar corrosion (0.5), Structural crack (1.0)
+    # 3. Class Weights
     class_weights = torch.tensor([0.2, 1.0, 2.5, 6.0, 12.0, 2.0, 0.5, 1.0], device=device)
 
     criterion = WeightedCombinedLoss(num_classes=args.num_classes, class_weights=class_weights)
@@ -148,6 +228,12 @@ def main(args):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     
     metrics_calculator = SegmentationMetrics(num_classes=args.num_classes)
+
+    history = {
+        'epoch': [], 'train_loss': [], 'val_loss': [], 
+        'val_mIoU': [], 'val_mDice': [], 'val_mPrecision': [], 
+        'val_mRecall': [], 'per_class_iou': []
+    }
 
     best_miou = 0.0
     best_epoch = 0
@@ -165,13 +251,36 @@ def main(args):
                 scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
             start_epoch = checkpoint["epoch"] + 1
             best_miou = checkpoint.get("best_miou", 0.0)
+            if "history" in checkpoint:
+                history = checkpoint["history"]
             print(f"=> Resumed from epoch {start_epoch}; best mIoU so far: {best_miou:.4f}")
 
-    print(f"\n--- Starting Training: {args.model_name} (Epochs {start_epoch} to {args.epochs}) ---")
+    print(f"--- Starting Training: {args.model_name} (Epochs {start_epoch} to {args.epochs}) ---")
     for epoch in range(start_epoch, args.epochs + 1):
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
         val_metrics = validate(model, val_loader, criterion, metrics_calculator, device)
         scheduler.step()
+
+        # Update History
+        history['epoch'].append(epoch)
+        history['train_loss'].append(train_loss)
+        history['val_loss'].append(val_metrics['loss'])
+        history['val_mIoU'].append(val_metrics['mIoU'])
+        history['val_mDice'].append(val_metrics['mDice'])
+        history['val_mPrecision'].append(val_metrics['mPrecision'])
+        history['val_mRecall'].append(val_metrics['mRecall'])
+        history['per_class_iou'].append(val_metrics['per_class_iou'])
+
+        # Save Metrics CSV
+        row = [
+            epoch, f"{train_loss:.4f}", f"{val_metrics['loss']:.4f}", 
+            f"{val_metrics['mIoU']:.4f}", f"{val_metrics['mDice']:.4f}", 
+            f"{val_metrics['mPrecision']:.4f}", f"{val_metrics['mRecall']:.4f}"
+        ] + [f"{iou:.4f}" for iou in val_metrics['per_class_iou']]
+        append_metrics_csv(csv_path, row, is_first=(epoch == 1))
+
+        # Generate Updated Figures
+        generate_and_save_plots(history, exp_dir)
 
         print(f"Epoch [{epoch:03d}/{args.epochs:03d}] | "
               f"Train Loss: {train_loss:.4f} | "
@@ -187,10 +296,11 @@ def main(args):
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
             'best_miou': best_miou,
-            'val_metrics': val_metrics
+            'val_metrics': val_metrics,
+            'history': history
         }
 
-        last_path = os.path.join(args.checkpoint_dir, f"last_{args.model_name}.pth")
+        last_path = os.path.join(weights_dir, "last.pth")
         torch.save(checkpoint_state, last_path)
 
         if val_metrics['mIoU'] > best_miou:
@@ -198,14 +308,15 @@ def main(args):
             best_epoch = epoch
             best_metrics = val_metrics
             checkpoint_state['best_miou'] = best_miou
-            best_path = os.path.join(args.checkpoint_dir, f"best_{args.model_name}.pth")
+            best_path = os.path.join(weights_dir, "best.pth")
             torch.save(checkpoint_state, best_path)
             print(f" Saved new best model checkpoint to {best_path} (mIoU: {best_miou:.4f})")
 
-    # 5. Summary Output
+    # Final Summary Report
     print("\n" + "=" * 70)
-    print(f" TRAINING COMPLETE: {args.model_name.upper()}")
+    print(f" TRAINING COMPLETE: {args.model_name.upper()} (Run: {args.exp_name})")
     print("=" * 70)
+    print(f" Run Directory:        {exp_dir}")
     print(f" Best Epoch:           {best_epoch} / {args.epochs}")
     print(f" Best Val mIoU:        {best_miou:.4f} ({best_miou*100:.2f}%)")
     if best_metrics:
@@ -238,7 +349,10 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=2, help="DataLoader workers")
     parser.add_argument("--pretrained", action=argparse.BooleanOptionalAction, default=True, help="Use pretrained encoder weights")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume training from")
-    parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints", help="Directory to save weights")
+    
+    # Run directory settings
+    parser.add_argument("--runs_dir", type=str, default="/content/drive/MyDrive/Colab Notebooks/concrete_damage_checkpoints/runs/segment", help="Base directory for experiment runs")
+    parser.add_argument("--exp_name", type=str, default="round1", help="Unique name for this training run (e.g., round1, round2_deeplab)")
 
     args = parser.parse_args()
     main(args)
