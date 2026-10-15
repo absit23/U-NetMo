@@ -70,11 +70,15 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}\n")
 
-    # Experiment Tracker Setup
-    tracker = ExperimentTracker(args.runs_dir, args.exp_name, args)
-    print(f"Artifacts will be saved to: {tracker.exp_dir}\n")
+    # Set up unified experiment output directory: runs_dir / exp_name
+    exp_dir = os.path.join(args.runs_dir, args.exp_name)
+    os.makedirs(exp_dir, exist_ok=True)
 
-    # DataLoaders
+    # Initialize tracker (saves args.json and prepares metrics CSV)
+    tracker = ExperimentTracker(exp_dir, args)
+
+    print(f"Experiment Output Directory: {exp_dir}\n")
+
     train_loader = DataLoader(
         ConcreteDamageDataset(
             os.path.join(args.data_dir, "train", "images"),
@@ -90,7 +94,6 @@ def main(args):
         ), batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers
     )
 
-    # Model & Optimization
     model = build_model(args.model_name, n_channels=3, n_classes=args.num_classes, pretrained=args.pretrained).to(device)
     class_weights = torch.tensor([0.2, 1.0, 2.5, 6.0, 12.0, 2.0, 0.5, 1.0], device=device)
     criterion = WeightedCombinedLoss(num_classes=args.num_classes, class_weights=class_weights)
@@ -105,8 +108,11 @@ def main(args):
     }
     best_miou, start_epoch = 0.0, 1
 
-    if args.resume and os.path.isfile(args.resume):
-        checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
+    # Resume checkpoint lookup inside exp_dir if specified or default
+    resume_path = args.resume or os.path.join(exp_dir, f"last_{args.model_name}.pth")
+    if os.path.isfile(resume_path):
+        print(f"=> Resume checkpoint found: '{resume_path}'")
+        checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         if "scheduler_state_dict" in checkpoint:
@@ -114,16 +120,14 @@ def main(args):
         start_epoch = checkpoint["epoch"] + 1
         best_miou = checkpoint.get("best_miou", 0.0)
         history = checkpoint.get("history", history)
-        print(f"=> Resumed from epoch {start_epoch} (Best mIoU: {best_miou:.4f})")
+        print(f"=> Resumed from epoch {start_epoch} (Best mIoU so far: {best_miou:.4f})")
 
-    # Training Loop
     print(f"--- Training {args.model_name.upper()} (Epochs {start_epoch}-{args.epochs}) ---")
     for epoch in range(start_epoch, args.epochs + 1):
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
         val_metrics = validate(model, val_loader, criterion, metrics_calculator, device)
         scheduler.step()
 
-        # Log Metrics & Save Plots via Tracker
         tracker.log_epoch(epoch, train_loss, val_metrics, history)
 
         print(f"Epoch [{epoch:03d}/{args.epochs:03d}] | Train Loss: {train_loss:.4f} | "
@@ -131,18 +135,24 @@ def main(args):
               f"F1: {val_metrics['mDice']:.4f}")
 
         checkpoint_state = {
-            'epoch': epoch, 'model_state_dict': model.state_dict(),
+            'epoch': epoch, 
+            'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
-            'best_miou': best_miou, 'history': history
+            'best_miou': best_miou, 
+            'history': history
         }
 
-        torch.save(checkpoint_state, os.path.join(tracker.weights_dir, "last.pth"))
+        # Save weights directly inside the specific round directory
+        last_path = os.path.join(exp_dir, f"last_{args.model_name}.pth")
+        torch.save(checkpoint_state, last_path)
+
         if val_metrics['mIoU'] > best_miou:
             best_miou = val_metrics['mIoU']
             checkpoint_state['best_miou'] = best_miou
-            torch.save(checkpoint_state, os.path.join(tracker.weights_dir, "best.pth"))
-            print(f" Saved new best model to {tracker.weights_dir}/best.pth (mIoU: {best_miou:.4f})")
+            best_path = os.path.join(exp_dir, f"best_{args.model_name}.pth")
+            torch.save(checkpoint_state, best_path)
+            print(f" Saved new best model to {best_path} (mIoU: {best_miou:.4f})")
 
 
 if __name__ == "__main__":
