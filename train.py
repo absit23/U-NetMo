@@ -24,9 +24,7 @@ class CombinedLoss(nn.Module):
         self.ce = nn.CrossEntropyLoss()
 
     def forward(self, logits, targets):
-        # Fix: Cast targets to torch.long to match CrossEntropy and one_hot expectations
         targets = targets.long()
-
         ce_loss = self.ce(logits, targets)
 
         probs = F.softmax(logits, dim=1)
@@ -78,7 +76,6 @@ def validate(model, dataloader, criterion, metrics_calculator, device):
 
         metrics_calculator.update(outputs, masks)
 
-    # Calculate validation metrics excluding background class 0
     metrics = metrics_calculator.compute(include_background=False)
     metrics["loss"] = running_loss / len(dataloader)
     return metrics
@@ -86,7 +83,7 @@ def validate(model, dataloader, criterion, metrics_calculator, device):
 
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    print(f"Using device: {device}\n")
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
@@ -112,6 +109,26 @@ def main(args):
         n_classes=args.num_classes,
         pretrained=args.pretrained
     ).to(device)
+
+    # --- Model Structure & Parameter Summary ---
+    print("=" * 70)
+    print(f" MODEL ARCHITECTURE & SUMMARY: {args.model_name.upper()}")
+    print("=" * 70)
+    
+    try:
+        from torchinfo import summary
+        summary(model, input_size=(args.batch_size, 3, args.img_size, args.img_size), device=device.type)
+    except ImportError:
+        print(model)
+        print("-" * 70)
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        non_trainable_params = total_params - trainable_params
+        
+        print(f"Total Parameters:         {total_params:,}")
+        print(f"Trainable Parameters:     {trainable_params:,}")
+        print(f"Non-Trainable Parameters: {non_trainable_params:,}")
+    print("=" * 70 + "\n")
 
     # 3. Loss, Optimizer & Scheduler
     criterion = CombinedLoss(num_classes=args.num_classes)
@@ -147,10 +164,11 @@ def main(args):
         print(f"Epoch [{epoch:03d}/{args.epochs:03d}] | "
               f"Train Loss: {train_loss:.4f} | "
               f"Val Loss: {val_metrics['loss']:.4f} | "
-              f"Val mIoU (no bg): {val_metrics['mIoU']:.4f} | "
-              f"Val mDice (no bg): {val_metrics['mDice']:.4f}")
+              f"mIoU: {val_metrics['mIoU']:.4f} | "
+              f"F1 (mDice): {val_metrics['mDice']:.4f} | "
+              f"Precision: {val_metrics['mPrecision']:.4f} | "
+              f"Recall: {val_metrics['mRecall']:.4f}")
 
-        # State dict payload
         checkpoint_state = {
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
@@ -159,11 +177,9 @@ def main(args):
             'best_miou': best_miou,
         }
 
-        # Save latest state for interruption recovery
         last_path = os.path.join(args.checkpoint_dir, f"last_{args.model_name}.pth")
         torch.save(checkpoint_state, last_path)
 
-        # Save best model checkpoint
         if val_metrics['mIoU'] > best_miou:
             best_miou = val_metrics['mIoU']
             checkpoint_state['best_miou'] = best_miou
