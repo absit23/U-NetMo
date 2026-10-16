@@ -2,13 +2,31 @@ import os
 import json
 import csv
 import matplotlib
-matplotlib.use('Agg')  # Force headless backend to prevent Colab plotting crashes
+matplotlib.use('Agg')  # Headless backend to prevent rendering issues in Colab
 import matplotlib.pyplot as plt
 
 CLASS_NAMES = [
     "Background", "Delamination", "Efflorescence", "Microcrack",
     "Minor spalling", "Moderate spalling", "Rebar corrosion", "Structural crack"
 ]
+
+def get_next_exp_name(runs_dir, prefix="round"):
+    """
+    Scans runs_dir and automatically picks the next round folder name
+    (e.g., round1, round2, round3...).
+    """
+    if not os.path.exists(runs_dir):
+        return f"{prefix}1"
+    existing = [d for d in os.listdir(runs_dir) if os.path.isdir(os.path.join(runs_dir, d))]
+    numbers = []
+    for d in existing:
+        if d.startswith(prefix):
+            num_part = d[len(prefix):]
+            if num_part.isdigit():
+                numbers.append(int(num_part))
+    next_num = max(numbers) + 1 if numbers else 1
+    return f"{prefix}{next_num}"
+
 
 class ExperimentTracker:
     def __init__(self, exp_dir, args):
@@ -17,7 +35,7 @@ class ExperimentTracker:
         
         os.makedirs(self.exp_dir, exist_ok=True)
         
-        # Save hyperparameter configuration
+        # Save hyperparameter configuration as JSON
         with open(os.path.join(self.exp_dir, "args.json"), "w") as f:
             json.dump(vars(args), f, indent=4)
 
@@ -40,7 +58,7 @@ class ExperimentTracker:
         history['val_mRecall'].append(v_mrec)
         history['per_class_iou'].append(per_class_iou)
 
-        # Append to CSV
+        # Log to CSV
         file_exists = os.path.isfile(self.csv_path)
         with open(self.csv_path, mode='a', newline='') as f:
             writer = csv.writer(f)
